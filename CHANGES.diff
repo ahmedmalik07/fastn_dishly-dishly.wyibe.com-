@@ -1,0 +1,250 @@
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 670cc3d..f39794b 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -263,6 +263,10 @@ model Restaurant {
+ 
+   subscriptionPayments SubscriptionPayment[]
+ 
++  // ---- dish.ly Connect (embedded integrations via Fastn) ----
++  integrationSettings IntegrationSettings?
++  integrationEvents   IntegrationEvent[]
++
+   @@index([subscriptionStatus])
+ }
+ 
+@@ -877,3 +881,50 @@ model PaymentCheckout {
+   @@index([restaurantId, createdAt])
+   @@index([orderId])
+ }
++
++/**
++ * dish.ly Connect: one row per restaurant that has opened the Integrations
++ * page. Each restaurant is its own Fastn customer (tenant), so the accounts it
++ * connects (HubSpot, Slack, Google...) are never visible to any other
++ * restaurant. The defaults below are the "configuration template" a new
++ * restaurant starts from.
++ */
++model IntegrationSettings {
++  id                       String     @id @default(cuid())
++  restaurantId             String     @unique
++  restaurant               Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
++  // Fastn customer (end org) UUID for this restaurant. Null until provisioned.
++  fastnEndOrgId            String?
++  enabled                  Boolean    @default(true)
++  // Orders at or above this total raise a manager alert (cents). 10,000.00
++  bigOrderThresholdCents   Int        @default(1000000)
++  slackChannel             String     @default("#general")
++  sheetName                String     @default("dish.ly daily sales")
++  ownerEmail               String?
++  sendCustomersToCrm       Boolean    @default(true)
++  sendShiftReports         Boolean    @default(true)
++  sendKhataReminders       Boolean    @default(true)
++  createdAt                DateTime   @default(now())
++  updatedAt                DateTime   @updatedAt
++}
++
++/**
++ * Outbox of everything dish.ly handed to Fastn for a restaurant. Gives the
++ * owner a visible sync history, and lets a failed delivery be retried from
++ * the Integrations page instead of being lost.
++ */
++model IntegrationEvent {
++  id           String     @id @default(cuid())
++  restaurantId String
++  restaurant   Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
++  type         String     // order.paid | order.cancelled | order.refunded | shift.closed | khata.reminder | test.ping
++  payload      Json
++  status       String     @default("PENDING") // PENDING | SENT | FAILED | SKIPPED
++  attempts     Int        @default(0)
++  lastError    String?
++  executionId  String?
++  createdAt    DateTime   @default(now())
++  sentAt       DateTime?
++
++  @@index([restaurantId, createdAt])
++}
+diff --git a/src/app/api/staff/orders/[id]/charge/route.ts b/src/app/api/staff/orders/[id]/charge/route.ts
+index 9afcfcd..3d3c0d7 100644
+--- a/src/app/api/staff/orders/[id]/charge/route.ts
++++ b/src/app/api/staff/orders/[id]/charge/route.ts
+@@ -1,4 +1,5 @@
+ import { NextResponse } from "next/server";
++import { emitOrderEvent } from "@/lib/fastn";
+ import { z } from "zod";
+ import { prisma } from "@/lib/db";
+ import { requireStaff, isErrorResponse } from "@/lib/staffApi";
+@@ -195,6 +196,7 @@ async function handleCharge(req: Request, { params }: Params) {
+   }
+ 
+   bumpRevision(restaurant.id);
++  emitOrderEvent(restaurant.id, "order.paid", order.id);
+   await logAudit({
+     restaurantId: restaurant.id,
+     actorId: session.user.id,
+diff --git a/src/app/api/staff/orders/[id]/refund/route.ts b/src/app/api/staff/orders/[id]/refund/route.ts
+index 63af618..ad71262 100644
+--- a/src/app/api/staff/orders/[id]/refund/route.ts
++++ b/src/app/api/staff/orders/[id]/refund/route.ts
+@@ -1,4 +1,5 @@
+ import { NextResponse } from "next/server";
++import { emitOrderEvent } from "@/lib/fastn";
+ import { z } from "zod";
+ import { prisma } from "@/lib/db";
+ import { requireStaff, isErrorResponse } from "@/lib/staffApi";
+@@ -58,6 +59,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
+     });
+     if ("error" in result) return NextResponse.json({ error: result.error }, { status: result.status });
+     bumpRevision(session.restaurant.id);
++    emitOrderEvent(session.restaurant.id, "order.refunded", id);
+     return NextResponse.json({ ok: true, ...result });
+   } catch (error) {
+     log.error("refund recording failed", { orderId: id, error: (error as Error).message });
+diff --git a/src/app/api/staff/orders/[id]/route.ts b/src/app/api/staff/orders/[id]/route.ts
+index 34f12bb..2f077ee 100644
+--- a/src/app/api/staff/orders/[id]/route.ts
++++ b/src/app/api/staff/orders/[id]/route.ts
+@@ -1,4 +1,5 @@
+ import { NextResponse } from "next/server";
++import { emitOrderEvent } from "@/lib/fastn";
+ import { z } from "zod";
+ import { prisma } from "@/lib/db";
+ import { requireStaff, isErrorResponse, scopedFindOrNotFound } from "@/lib/staffApi";
+@@ -55,6 +56,7 @@ export async function PATCH(req: Request, { params }: Params) {
+ 
+   // Log money-affecting transitions (cancel / paid) for the activity trail.
+   if (parsed.data.status === "CANCELLED") {
++    emitOrderEvent(session.restaurant.id, "order.cancelled", id);
+     await logAudit({
+       restaurantId: session.restaurant.id,
+       actorId: session.user.id,
+diff --git a/src/app/api/staff/orders/manual/route.ts b/src/app/api/staff/orders/manual/route.ts
+index c221a64..3a0939c 100644
+--- a/src/app/api/staff/orders/manual/route.ts
++++ b/src/app/api/staff/orders/manual/route.ts
+@@ -1,4 +1,5 @@
+ import { NextResponse } from "next/server";
++import { emitOrderEvent } from "@/lib/fastn";
+ import { z } from "zod";
+ import { prisma } from "@/lib/db";
+ import { requireStaff, isErrorResponse, scopedFindOrNotFound } from "@/lib/staffApi";
+@@ -166,6 +167,7 @@ async function handleManualOrder(req: Request) {
+   });
+ 
+   if (status === "PLACED") bumpRevision(session.restaurant.id);
++  if (status === "PAID") emitOrderEvent(session.restaurant.id, "order.paid", order.id);
+ 
+   await logAudit({
+     restaurantId: session.restaurant.id,
+diff --git a/src/app/api/staff/pos/orders/route.ts b/src/app/api/staff/pos/orders/route.ts
+index d60c288..a73e137 100644
+--- a/src/app/api/staff/pos/orders/route.ts
++++ b/src/app/api/staff/pos/orders/route.ts
+@@ -1,4 +1,5 @@
+ import { NextResponse } from "next/server";
++import { emitOrderEvent } from "@/lib/fastn";
+ import { z } from "zod";
+ import { prisma } from "@/lib/db";
+ import { requireStaff, isErrorResponse, scopedFindOrNotFound } from "@/lib/staffApi";
+@@ -324,6 +325,7 @@ async function handlePosOrder(req: Request) {
+   }
+ 
+   bumpRevision(restaurant.id);
++  emitOrderEvent(restaurant.id, "order.paid", order.id);
+   await logAudit({
+     restaurantId: restaurant.id,
+     actorId: session.user.id,
+diff --git a/src/app/api/staff/shifts/close/route.ts b/src/app/api/staff/shifts/close/route.ts
+index fcf61f7..1436948 100644
+--- a/src/app/api/staff/shifts/close/route.ts
++++ b/src/app/api/staff/shifts/close/route.ts
+@@ -1,4 +1,5 @@
+ import { NextResponse } from "next/server";
++import { emitIntegrationEvent } from "@/lib/fastn";
+ import { z } from "zod";
+ import { prisma } from "@/lib/db";
+ import { requireStaff, isErrorResponse } from "@/lib/staffApi";
+@@ -76,6 +77,26 @@ async function handleCloseShift(req: Request) {
+     ).toFixed(2)} · variance ${(variance / 100).toFixed(2)}`,
+   });
+ 
++  const closedAt = new Date();
++  emitIntegrationEvent(session.restaurant.id, "shift.closed", async () => ({
++    shiftId: shift.id,
++    openedAt: shift.openedAt.toISOString(),
++    closedAt: closedAt.toISOString(),
++    openedBy: shift.openedBy?.name ?? null,
++    closedBy: session.user.name,
++    orderCount: totals.orderCount,
++    sales: totals.salesTotalCents / 100,
++    tax: totals.taxCents / 100,
++    refunds: totals.refundedCents / 100,
++    cash: totals.byMethod.CASH / 100,
++    card: totals.byMethod.CARD / 100,
++    wallet: totals.byMethod.WALLET / 100,
++    khata: totals.byMethod.CREDIT / 100,
++    expectedCash: totals.expectedCashCents / 100,
++    countedCash: parsed.data.countedCashCents / 100,
++    variance: variance / 100,
++  }));
++
+   return NextResponse.json({
+     ok: true,
+     shiftId: shift.id,
+diff --git a/src/app/api/staff/tables/[id]/charge-all/route.ts b/src/app/api/staff/tables/[id]/charge-all/route.ts
+index ebced89..5cb926f 100644
+--- a/src/app/api/staff/tables/[id]/charge-all/route.ts
++++ b/src/app/api/staff/tables/[id]/charge-all/route.ts
+@@ -1,4 +1,5 @@
+ import { NextResponse } from "next/server";
++import { emitOrderEvent } from "@/lib/fastn";
+ import { z } from "zod";
+ import { prisma } from "@/lib/db";
+ import { requireStaff, isErrorResponse } from "@/lib/staffApi";
+@@ -166,6 +167,7 @@ async function handleChargeAll(req: Request, { params }: Params) {
+   // Payment is already durable. External failures must not tell the cashier to
+   // collect the same payment again; missing fiscal numbers can be retried.
+   bumpRevision(restaurantId);
++  for (const o of settlement.orders) emitOrderEvent(restaurantId, "order.paid", o.id);
+   await Promise.all(settlement.orders.map(async (order, index) => {
+     try {
+       const bill = settlement.quote.bills[index];
+diff --git a/src/components/admin/AdminNav.tsx b/src/components/admin/AdminNav.tsx
+index f71ce7a..01cec62 100644
+--- a/src/components/admin/AdminNav.tsx
++++ b/src/components/admin/AdminNav.tsx
+@@ -16,6 +16,7 @@ const BASE_NAV = [
+   { href: "/admin/tables", label: "Tables & QR", icon: "M3 4h7v7H3z M14 4h7v7h-7z M3 15h7v7H3z M15 15h2v2h-2z M21 15v7h-6" },
+   { href: "/admin/reservations", label: "Reservations", icon: "M4 5h16v16H4z M4 10h16 M8 3v4 M16 3v4" },
+   { href: "/admin/staff", label: "Staff", icon: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M17 4a4 4 0 0 1 0 7 M18 15a4 4 0 0 1 4 4v2" },
++  { href: "/admin/integrations", label: "Integrations", icon: "M9 7V3 M15 7V3 M7 7h10v4a5 5 0 0 1-10 0z M12 16v5" },
+   { href: "/admin/activity", label: "Activity", icon: "M3 12h4l3-8 4 16 3-8h4" },
+   { href: "/admin/settings", label: "Settings", icon: "M4 7h16 M4 17h16 M8 4v6 M16 14v6" },
+ ];
+diff --git a/src/lib/backup.ts b/src/lib/backup.ts
+index a1400f7..7b913d9 100644
+--- a/src/lib/backup.ts
++++ b/src/lib/backup.ts
+@@ -49,6 +49,8 @@ export const BACKUP_TABLE_ORDER = [
+   "verificationToken",
+   "auditLog",
+   "serviceRequest",
++  "integrationSettings",
++  "integrationEvent",
+ ] as const;
+ 
+ export type BackupTable = (typeof BACKUP_TABLE_ORDER)[number];
+diff --git a/src/proxy.ts b/src/proxy.ts
+index 401f424..85f40db 100644
+--- a/src/proxy.ts
++++ b/src/proxy.ts
+@@ -120,6 +120,9 @@ export async function proxy(req: NextRequest) {
+     `connect-src 'self' https://prod.spline.design https://unpkg.com`,
+     // The Spline runtime decodes its scene off the main thread.
+     `worker-src 'self' blob:`,
++    // dish.ly Connect: the Fastn integrations widget is embedded as an iframe
++    // on /admin/integrations, and its OAuth pop-ups open from inside it.
++    `frame-src 'self' https://api.fastn.dev https://*.fastn.dev https://*.fastn.ai`,
+     `object-src 'none'`,
+     `base-uri 'self'`,
+     `form-action 'self'`,
